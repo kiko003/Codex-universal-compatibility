@@ -15,8 +15,16 @@ from .config import Config
 
 logger = logging.getLogger("codex_stripper.proxy")
 
-# Routes that need tool namespace transformation
-TRANSFORM_ROUTES = {"/v1/responses", "/v1/chat/completions"}
+
+# Path suffixes that need tool namespace transformation.
+# Codex may send to /responses or /v1/responses (same for chat/completions).
+_TRANSFORM_SUFFIXES = ("/responses", "/chat/completions")
+
+
+def _needs_transform(path: str) -> bool:
+    """Check if a request path needs tool namespace transformation."""
+    return any(path.endswith(suffix) for suffix in _TRANSFORM_SUFFIXES)
+
 
 # Per-request namespace map storage: keyed by aiohttp request id
 _namespace_maps: dict[int, dict] = {}
@@ -87,7 +95,7 @@ def _forward_headers(request: web.Request, upstream_api_key: str) -> dict:
 
 def _endpoint_for_path(path: str) -> str:
     """Determine the remapper endpoint label from the request path."""
-    if "/chat/completions" in path:
+    if path.endswith("/chat/completions"):
         return "chat/completions"
     return "responses"
 
@@ -97,8 +105,6 @@ async def _stream_response(
     downstream: web.StreamResponse,
 ) -> web.StreamResponse:
     """Pipe the upstream response body to the downstream stream."""
-    downstream.content_type = upstream_resp.content_type
-    downstream.status = upstream_resp.status
     try:
         chunk = await upstream_resp.content.readany()
         while chunk:
@@ -134,7 +140,7 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
     namespace_map: dict = {}
 
     # Intercept transformable routes
-    if method == "POST" and path in TRANSFORM_ROUTES and body:
+    if method == "POST" and _needs_transform(path) and body:
         try:
             parsed = json.loads(body)
             parsed, namespace_map = await transform_tools_request(parsed)
@@ -165,7 +171,7 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                 and "text/event-stream" in upstream_resp.content_type
             )
             needs_response_transform = (
-                path in TRANSFORM_ROUTES
+                _needs_transform(path)
                 and namespace_map
                 and not is_sse
                 and upstream_resp.status == 200
@@ -200,7 +206,11 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
 
             # Streaming or non-transformable: pass through as-is.
             _namespace_maps.pop(id(request), None)
-            downstream = web.StreamResponse()
+            downstream = web.StreamResponse(
+                status=upstream_resp.status,
+                reason=upstream_resp.reason,
+                headers={"Content-Type": upstream_resp.content_type} if upstream_resp.content_type else None,
+            )
             await downstream.prepare(request)
             return await _stream_response(upstream_resp, downstream)
 
