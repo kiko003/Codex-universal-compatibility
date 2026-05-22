@@ -1,0 +1,9 @@
+services:
+  codex-stripper:
+    build: .
+    container_name: codex-stripper
+    ports:
+      - "${STRIPPER_PORT:-8080}:${STRIPPER_PORT:-8080}"
+    env_file:
+      - .env
+    restart: unless-stopped

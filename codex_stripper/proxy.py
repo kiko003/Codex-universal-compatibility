@@ -34,7 +34,6 @@ async def transform_tools_request(body: dict) -> tuple[dict, dict]:
         per-request so the response hook can un-flatten.
     """
     transformed, namespace_map = flatten_request_body(body)
-
     if namespace_map:
         namespaces = {v["namespace"] for v in namespace_map.values()}
         logger.info(
@@ -43,12 +42,14 @@ async def transform_tools_request(body: dict) -> tuple[dict, dict]:
             len(namespaces),
             ", ".join(sorted(namespaces)),
         )
-
     return transformed, namespace_map
 
 
 async def transform_tools_response(
-    body: dict, namespace_map: dict, *, endpoint: str = "responses",
+    body: dict,
+    namespace_map: dict,
+    *,
+    endpoint: str = "responses",
 ) -> dict:
     """Remap flattened function names back in the response body."""
     if not namespace_map:
@@ -68,13 +69,19 @@ async def transform_tools_response(
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _forward_headers(request: web.Request) -> dict:
-    """Copy request headers, removing hop-by-hop headers."""
+def _forward_headers(request: web.Request, upstream_api_key: str) -> dict:
+    """Copy request headers, removing hop-by-hop headers.
+
+    If upstream_api_key is set, override the Authorization header with
+    Bearer <upstream_api_key>. Otherwise preserve the original Authorization.
+    """
     headers = {}
     skip = {"host", "transfer-encoding", "content-length"}
     for key, value in request.headers.items():
         if key.lower() not in skip:
             headers[key] = value
+    if upstream_api_key:
+        headers["authorization"] = f"Bearer {upstream_api_key}"
     return headers
 
 
@@ -99,7 +106,7 @@ async def _stream_response(
             chunk = await upstream_resp.content.readany()
     except Exception:
         logger.exception("Error streaming upstream response")
-    await downstream.write_eof()
+        await downstream.write_eof()
     return downstream
 
 
@@ -115,7 +122,8 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
     """Generic transparent proxy handler for all methods and paths."""
     path = request.path
     method = request.method
-    forward_headers = _forward_headers(request)
+    upstream_api_key: str = request.app["upstream_api_key"]
+    forward_headers = _forward_headers(request, upstream_api_key)
     upstream = f"{request.app['upstream_url']}{path}"
 
     # Read request body (may be empty for GET/DELETE etc.)
@@ -171,7 +179,9 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                     resp_body = json.loads(raw)
                     endpoint = _endpoint_for_path(path)
                     resp_body = await transform_tools_response(
-                        resp_body, namespace_map, endpoint=endpoint,
+                        resp_body,
+                        namespace_map,
+                        endpoint=endpoint,
                     )
                     return web.Response(
                         body=json.dumps(resp_body).encode(),
@@ -189,9 +199,6 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                     )
 
             # Streaming or non-transformable: pass through as-is.
-            # For streaming responses we do NOT try to transform individual
-            # chunks -- tool calls in streaming come as delta events and are
-            # too complex to reliably rewrite on the fly.
             _namespace_maps.pop(id(request), None)
             downstream = web.StreamResponse()
             await downstream.prepare(request)
@@ -209,7 +216,11 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
 
 async def on_startup(app: web.Application) -> None:
     app["client_session"] = ClientSession()
-    logger.info("ClientSession created, upstream=%s", app["upstream_url"])
+    logger.info(
+        "ClientSession created, upstream=%s, api_key=%s",
+        app["upstream_url"],
+        "set" if app["upstream_api_key"] else "none",
+    )
 
 
 async def on_cleanup(app: web.Application) -> None:
@@ -229,6 +240,7 @@ def create_app(config: Config | None = None) -> web.Application:
 
     app = web.Application()
     app["upstream_url"] = config.UPSTREAM_URL
+    app["upstream_api_key"] = config.UPSTREAM_API_KEY
     app["config"] = config
 
     app.router.add_get("/health", health)
@@ -237,7 +249,6 @@ def create_app(config: Config | None = None) -> web.Application:
 
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
-
     return app
 
 
@@ -249,7 +260,12 @@ def main() -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
     app = create_app(config)
-    logger.info("Starting proxy on port %d -> %s", config.LISTEN_PORT, config.UPSTREAM_URL)
+    logger.info(
+        "Starting proxy on port %d -> %s (api_key=%s)",
+        config.LISTEN_PORT,
+        config.UPSTREAM_URL,
+        "set" if config.UPSTREAM_API_KEY else "none",
+    )
     web.run_app(app, host="0.0.0.0", port=config.LISTEN_PORT, print=logger.info)
 
 
