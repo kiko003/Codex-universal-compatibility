@@ -94,12 +94,75 @@ class TestFlattenNamespaceTools:
         assert "strict" not in flat[0]
 
     def test_non_function_type_passthrough(self):
+        """When strip_non_function=False, unknown types pass through."""
         other = {"type": "computer_20241022", "display_width": 1280}
-        flat, ns_map = flatten_namespace_tools([other])
+        flat, ns_map = flatten_namespace_tools([other], strip_non_function=False)
 
         assert len(flat) == 1
         assert flat[0]["type"] == "computer_20241022"
         assert ns_map == {}
+
+    def test_non_function_type_dropped_by_default(self):
+        """Non-function types are dropped when strip_non_function=True (default)."""
+        tools = [
+            {"type": "tool_search", "name": "tool_search"},
+            {"type": "web_search", "name": "web_search"},
+            {"type": "computer_20241022", "display_width": 1280},
+        ]
+        flat, ns_map = flatten_namespace_tools(tools)
+
+        assert flat == []
+        assert ns_map == {}
+
+    def test_mixed_function_and_non_function_strips_non_function(self):
+        """Only function tools survive when strip_non_function=True."""
+        tools = [
+            _func_tool("my_func", "A real function"),
+            {"type": "tool_search", "name": "tool_search"},
+            {"type": "web_search", "name": "web_search"},
+        ]
+        flat, ns_map = flatten_namespace_tools(tools)
+
+        assert len(flat) == 1
+        assert flat[0]["type"] == "function"
+        assert flat[0]["name"] == "my_func"
+
+    def test_strip_non_function_false_keeps_all(self):
+        """When strip_non_function=False, all types pass through."""
+        tools = [
+            _func_tool("my_func", "A real function"),
+            {"type": "tool_search", "name": "tool_search"},
+            {"type": "web_search", "name": "web_search"},
+        ]
+        flat, ns_map = flatten_namespace_tools(tools, strip_non_function=False)
+
+        assert len(flat) == 3
+        assert flat[0]["type"] == "function"
+        assert flat[1]["type"] == "tool_search"
+        assert flat[2]["type"] == "web_search"
+
+    def test_non_function_sub_tool_in_namespace_dropped(self):
+        """Non-function sub-tools inside a namespace are dropped by default."""
+        ns = _ns_tool("mcp__ctx7__", [
+            _func_tool("Ctx7_query", "Query"),
+            {"type": "tool_search", "name": "search"},
+        ])
+        flat, ns_map = flatten_namespace_tools([ns])
+
+        assert len(flat) == 1
+        assert flat[0]["name"] == "mcp__ctx7__Ctx7_query"
+
+    def test_non_function_sub_tool_in_namespace_kept_when_disabled(self):
+        """Non-function sub-tools inside a namespace are kept when strip_non_function=False."""
+        ns = _ns_tool("mcp__ctx7__", [
+            _func_tool("Ctx7_query", "Query"),
+            {"type": "tool_search", "name": "search"},
+        ])
+        flat, ns_map = flatten_namespace_tools([ns], strip_non_function=False)
+
+        assert len(flat) == 2
+        assert flat[0]["name"] == "mcp__ctx7__Ctx7_query"
+        assert flat[1]["type"] == "tool_search"
 
     def test_empty_tools_array(self):
         flat, ns_map = flatten_namespace_tools([])
@@ -183,6 +246,37 @@ class TestFlattenRequestBodyResponses:
         original_tools_len = len(body["tools"])
         _ = flatten_request_body(body)
         assert len(body["tools"]) == original_tools_len
+
+    def test_non_function_tools_dropped_by_default(self):
+        """tool_search and web_search types are dropped from /v1/responses body."""
+        body = {
+            "model": "gpt-4o",
+            "tools": [
+                {"type": "tool_search", "name": "tool_search"},
+                _func_tool("my_func", "A real function"),
+                {"type": "web_search", "name": "web_search"},
+            ],
+        }
+        result, ns_map = flatten_request_body(body)
+
+        assert len(result["tools"]) == 1
+        assert result["tools"][0]["type"] == "function"
+        assert result["tools"][0]["name"] == "my_func"
+
+    def test_non_function_tools_kept_when_disabled(self):
+        """Non-function types are kept when strip_non_function=False."""
+        body = {
+            "model": "gpt-4o",
+            "tools": [
+                {"type": "tool_search", "name": "tool_search"},
+                _func_tool("my_func", "A real function"),
+            ],
+        }
+        result, ns_map = flatten_request_body(body, strip_non_function=False)
+
+        assert len(result["tools"]) == 2
+        assert result["tools"][0]["type"] == "tool_search"
+        assert result["tools"][1]["type"] == "function"
 
 
 # -----------------------------------------------------------------------
@@ -276,6 +370,30 @@ class TestFlattenRequestBodyChatCompletions:
         assert "mcp__db__DB_insert" in names
         assert "strict" not in result["tools"][0]["function"]
         assert len(ns_map) == 2
+
+    def test_chat_completions_non_function_dropped(self):
+        """Non-function tools like tool_search are dropped in chat/completions format."""
+        body = {
+            "model": "gpt-4o",
+            "messages": [],
+            "tools": [
+                {"type": "tool_search", "name": "tool_search"},
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Get weather",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                },
+                {"type": "web_search", "name": "web_search"},
+            ],
+        }
+        result, ns_map = flatten_request_body(body)
+
+        assert len(result["tools"]) == 1
+        assert result["tools"][0]["type"] == "function"
+        assert result["tools"][0]["function"]["name"] == "get_weather"
 
 
 # -----------------------------------------------------------------------

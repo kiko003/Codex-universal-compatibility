@@ -4,19 +4,23 @@ Codex (and OpenAI's /v1/responses endpoint) wraps MCP tools inside a
 ``type=namespace`` container.  Many OpenAI-compatible providers (NVIDIA NIM,
 DeepSeek, etc.) only understand flat ``type=function`` tools.  This module
 recursively flattens the namespace hierarchy so that every sub-tool becomes a
-stand-alone function tool with a dotted name (e.g. ``mcp__context7__Context7_query_docs``).
+stand-alone function tool with a dotted name (e.g.
+``mcp__context7__Context7_query_docs``).
 
 Public API
 ----------
-- :func:`flatten_namespace_tools`  – flatten a raw ``tools`` list.
-- :func:`flatten_request_body`     – flatten a full request body (supports
-  both ``/v1/responses`` and ``/v1/chat/completions`` formats).
+- :func:`flatten_namespace_tools` – flatten a raw ``tools`` list.
+- :func:`flatten_request_body` – flatten a full request body (supports both
+  ``/v1/responses`` and ``/v1/chat/completions`` formats).
 """
 
 from __future__ import annotations
 
+import logging
 from copy import deepcopy
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -25,6 +29,7 @@ from typing import Any
 
 def flatten_namespace_tools(
     tools: list[dict[str, Any]],
+    strip_non_function: bool = True,
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, str]]]:
     """Flatten namespace-wrapped MCP tools into flat function tools.
 
@@ -34,14 +39,20 @@ def flatten_namespace_tools(
         The ``tools`` array as it appears in a Codex request body.  Each entry
         is a dict that may be ``{"type": "namespace", ...}`` or
         ``{"type": "function", ...}`` (or any other type).
+    strip_non_function:
+        When *True* (default), tool entries whose type is neither
+        ``"namespace"`` nor ``"function"`` are **dropped** from the output
+        with a warning log.  This prevents Codex-specific types like
+        ``"tool_search"`` or ``"web_search"`` from being forwarded to
+        providers that only accept ``"function"``.  When *False*, unrecognised
+        types are passed through unchanged (legacy behaviour).
 
     Returns
     -------
     flattened_tools : list[dict[str, Any]]
         A new list where every namespace has been expanded into its constituent
-        function tools.  Plain ``type=function`` tools (and any unrecognised
-        types) are passed through unchanged.
-
+        function tools.  Depending on *strip_non_function*, unrecognised tool
+        types are either dropped or passed through.
     namespace_map : dict[str, dict[str, str]]
         A mapping from each flattened function name to its lineage::
 
@@ -60,9 +71,9 @@ def flatten_namespace_tools(
     - The ``"strict"`` field is stripped from every flattened function tool
       because many upstream providers reject it.
     - Nested namespaces (a namespace containing a namespace) are handled by
-      prepending each level of namespace to the inner tool names.  The
-      inner namespace itself is treated as a pass-through container (its
-      sub-tools are extracted recursively).
+      prepending each level of namespace to the inner tool names.  The inner
+      namespace itself is treated as a pass-through container (its sub-tools
+      are extracted recursively).
     - The input list is **not** mutated; deep copies are used throughout.
     """
     flattened: list[dict[str, Any]] = []
@@ -70,15 +81,28 @@ def flatten_namespace_tools(
 
     for tool in tools:
         tool_type = tool.get("type")
-
         if tool_type == "namespace":
-            _flatten_namespace(tool, prefix="", namespace_map=namespace_map, out=flattened)
-        else:
-            # Pass through unchanged (deep-copied so caller can't mutate input).
+            _flatten_namespace(
+                tool,
+                prefix="",
+                namespace_map=namespace_map,
+                out=flattened,
+                strip_non_function=strip_non_function,
+            )
+        elif tool_type == "function":
             entry = deepcopy(tool)
-            if tool_type == "function":
-                _strip_strict(entry)
+            _strip_strict(entry)
             flattened.append(entry)
+        else:
+            if strip_non_function:
+                logger.warning(
+                    "Dropping non-function tool type %r (name=%s); "
+                    "set STRIP_NON_FUNCTION=false to keep it.",
+                    tool_type,
+                    tool.get("name", "<unknown>"),
+                )
+            else:
+                flattened.append(deepcopy(tool))
 
     return flattened, namespace_map
 
@@ -89,6 +113,7 @@ def flatten_namespace_tools(
 
 def flatten_request_body(
     body: dict[str, Any],
+    strip_non_function: bool = True,
 ) -> tuple[dict[str, Any], dict[str, dict[str, str]]]:
     """Flatten namespace tools in a full API request body.
 
@@ -100,26 +125,27 @@ def flatten_request_body(
     * **``/v1/chat/completions``** – tools live at ``body["tools"]`` but each
       entry is ``{"type": "function", "function": {"name", ...}}``.
 
-    If the body has no ``"tools"`` key, or the value is an empty list, the body
-    is returned unchanged (with an empty namespace map).
+    If the body has no ``"tools"`` key, or the value is an empty list, the
+    body is returned unchanged (with an empty namespace map).
 
     Parameters
     ----------
     body:
         The full request body dict.
+    strip_non_function:
+        When *True* (default), non-function tool types are dropped.
+        See :func:`flatten_namespace_tools` for details.
 
     Returns
     -------
     transformed_body : dict[str, Any]
         A **new** dict (the original is not mutated) with the ``tools`` array
         replaced by its flattened version.
-
     namespace_map : dict[str, dict[str, str]]
         See :func:`flatten_namespace_tools`.
     """
     result = deepcopy(body)
     tools = result.get("tools")
-
     if not tools:
         return result, {}
 
@@ -127,9 +153,13 @@ def flatten_request_body(
     is_chat_completions = any("function" in t for t in tools)
 
     if is_chat_completions:
-        flat_tools, ns_map = _flatten_chat_completions_tools(tools)
+        flat_tools, ns_map = _flatten_chat_completions_tools(
+            tools, strip_non_function=strip_non_function,
+        )
     else:
-        flat_tools, ns_map = flatten_namespace_tools(tools)
+        flat_tools, ns_map = flatten_namespace_tools(
+            tools, strip_non_function=strip_non_function,
+        )
 
     result["tools"] = flat_tools
     return result, ns_map
@@ -145,11 +175,12 @@ def _flatten_namespace(
     prefix: str,
     namespace_map: dict[str, dict[str, str]],
     out: list[dict[str, Any]],
+    strip_non_function: bool = True,
 ) -> None:
     """Recursively flatten a single namespace tool into *out*.
 
-    *prefix* is the dot-separated namespace path built so far (e.g.
-    ``"mcp__context7__"``).
+    *prefix* is the dot-separated namespace path built so far
+    (e.g. ``"mcp__context7__"``).
     """
     ns_name: str = ns_tool.get("name", "")
     new_prefix = f"{prefix}{ns_name}" if prefix else ns_name
@@ -158,10 +189,15 @@ def _flatten_namespace(
 
     for sub in sub_tools:
         sub_type = sub.get("type")
-
         if sub_type == "namespace":
             # Nested namespace – recurse with accumulated prefix.
-            _flatten_namespace(sub, prefix=new_prefix, namespace_map=namespace_map, out=out)
+            _flatten_namespace(
+                sub,
+                prefix=new_prefix,
+                namespace_map=namespace_map,
+                out=out,
+                strip_non_function=strip_non_function,
+            )
         elif sub_type == "function":
             flat = _flatten_function(sub, prefix=new_prefix)
             flat_name = flat["name"]
@@ -171,21 +207,29 @@ def _flatten_namespace(
             }
             out.append({"type": "function", **flat})
         else:
-            # Unknown sub-tool type – pass through as-is.
-            out.append(deepcopy(sub))
+            # Unknown sub-tool type inside a namespace.
+            if strip_non_function:
+                logger.warning(
+                    "Dropping non-function sub-tool type %r inside "
+                    "namespace %r (name=%s); set STRIP_NON_FUNCTION=false "
+                    "to keep it.",
+                    sub_type,
+                    new_prefix,
+                    sub.get("name", "<unknown>"),
+                )
+            else:
+                out.append(deepcopy(sub))
 
 
 def _flatten_function(func_tool: dict[str, Any], *, prefix: str) -> dict[str, Any]:
     """Build a flat function dict with the namespace prepended to the name."""
     name = func_tool.get("name", "")
     flat_name = f"{prefix}{name}"
-
     flat: dict[str, Any] = {
         "name": flat_name,
         "description": _combine_description(prefix, func_tool.get("description", "")),
         "parameters": deepcopy(func_tool.get("parameters", {})),
     }
-
     return flat
 
 
@@ -204,6 +248,7 @@ def _strip_strict(tool: dict[str, Any]) -> None:
 
 def _flatten_chat_completions_tools(
     tools: list[dict[str, Any]],
+    strip_non_function: bool = True,
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, str]]]:
     """Flatten tools in ``/v1/chat/completions`` wrapping.
 
@@ -218,7 +263,9 @@ def _flatten_chat_completions_tools(
         else:
             normalised.append(deepcopy(t))
 
-    flat, ns_map = flatten_namespace_tools(normalised)
+    flat, ns_map = flatten_namespace_tools(
+        normalised, strip_non_function=strip_non_function,
+    )
 
     # Re-wrap each function tool back into {"type": "function", "function": {...}}.
     rewrapped: list[dict[str, Any]] = []

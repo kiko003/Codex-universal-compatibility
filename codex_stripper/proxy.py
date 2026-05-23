@@ -34,14 +34,30 @@ _namespace_maps: dict[int, dict] = {}
 # Transformation hooks (wired to real transformer/remapper)
 # ---------------------------------------------------------------------------
 
-async def transform_tools_request(body: dict) -> tuple[dict, dict]:
+async def transform_tools_request(
+    body: dict,
+    strip_non_function: bool = True,
+) -> tuple[dict, dict]:
     """Flatten namespace-wrapped tools in the request body.
+
+    Args:
+        body: Parsed JSON request body.
+        strip_non_function: When True, drop non-function tool types.
 
     Returns:
         (transformed_body, namespace_map) -- namespace_map is stored
         per-request so the response hook can un-flatten.
     """
-    transformed, namespace_map = flatten_request_body(body)
+    transformed, namespace_map = flatten_request_body(
+        body, strip_non_function=strip_non_function,
+    )
+    orig_count = len(body.get("tools", []))
+    new_count = len(transformed.get("tools", []))
+    if orig_count != new_count:
+        logger.info(
+            "Tool count changed: %d -> %d (strip_non_function=%s)",
+            orig_count, new_count, strip_non_function,
+        )
     if namespace_map:
         namespaces = {v["namespace"] for v in namespace_map.values()}
         logger.info(

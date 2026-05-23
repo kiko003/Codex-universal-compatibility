@@ -21,6 +21,7 @@ class Config:
     UPSTREAM_API_KEY: str
     LOG_LEVEL: str
     STRIP_STRICT_FIELD: bool
+    STRIP_NON_FUNCTION_TOOLS: bool
 
     def __init__(
         self,
@@ -29,6 +30,7 @@ class Config:
         upstream_api_key: str | None = None,
         log_level: str | None = None,
         strip_strict_field: bool | None = None,
+        strip_non_function_tools: bool | None = None,
     ) -> None:
         self.LISTEN_PORT = listen_port if listen_port is not None else int(
             os.environ.get("STRIPPER_PORT", "8080")
@@ -45,6 +47,9 @@ class Config:
         self.STRIP_STRICT_FIELD = strip_strict_field if strip_strict_field is not None else os.environ.get(
             "STRIP_STRICT", "true"
         ).lower() in ("true", "1", "yes")
+        self.STRIP_NON_FUNCTION_TOOLS = strip_non_function_tools if strip_non_function_tools is not None else os.environ.get(
+            "STRIP_NON_FUNCTION", "true"
+        ).lower() in ("true", "1", "yes")
 
     def __repr__(self) -> str:
         return (
@@ -52,5 +57,6 @@ class Config:
             f"upstream_url={self.UPSTREAM_URL!r}, "
             f"upstream_api_key={'***' if self.UPSTREAM_API_KEY else ''}, "
             f"log_level={self.LOG_LEVEL!r}, "
-            f"strip_strict_field={self.STRIP_STRICT_FIELD})"
+            f"strip_strict_field={self.STRIP_STRICT_FIELD}, "
+            f"strip_non_function_tools={self.STRIP_NON_FUNCTION_TOOLS})"
         )
